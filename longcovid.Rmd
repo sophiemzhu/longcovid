@@ -1,0 +1,1116 @@
+---
+title: "Compartmental QALY Code"
+author: "Sophie Zhu"
+date: '2023-09-29'
+output: html_document
+---
+# Load required packages
+
+```{r setup, message=F, warning=F}
+library(readxl)
+library(tidyverse)
+library(deSolve)
+library(data.table)
+library(knitr)
+library(zoo)
+library(cowplot)
+library(sensitivity)
+library(lhs)
+library(triangle)
+library(formatR)
+
+opts_chunk$set(tidy.opts=list(width.cutoff=60),tidy=TRUE)
+set.seed(19) #set seed to get same results across runs
+```
+
+# Pull and transform age specific time series data
+```{r pull-age-specific-infection}
+
+#Filter data to only cases, transform ages to standardized age brackets, subset to between March 1st 2020 and Dec. 31st 2022
+
+casedemographics<-read_excel("longcovid_ca_timeseries.xlsx")
+
+casedemo <-casedemographics %>%
+  mutate(date=as.Date(date, "%Y-%m-%d"),
+         cases=as.numeric(ifelse(cases=="Suppressed", 0, cases))) %>%
+  filter(date>="2020-02-21" & date<="2023-01-07") %>% ungroup() %>%
+  complete(date = seq.Date(as.Date("2020-02-21"), as.Date("2023-01-07"), by="day"), age_grp) %>%
+  mutate(cases = ifelse(is.na(cases), 0, cases))
+
+#Break dataset into subpopulation time series (0-4, 5-17, 18-49, 50-64, 65+)
+
+pop_0to4<- casedemo %>% filter(age_grp=="0-4") %>% mutate(roll=rollmeanr(cases, 7, fill = NA)) %>% filter(date > "2020-02-29" & date < "2023-01-01")
+
+pop_5to17<- casedemo %>% filter(age_grp=="5-17") %>% mutate(roll=rollmeanr(cases, 7, fill = NA)) %>% filter(date > "2020-02-29" & date < "2023-01-01")
+
+pop_18to49<- casedemo %>% filter(age_grp=="18-49") %>% mutate(roll=rollmeanr(cases, 7, fill = NA)) %>% filter(date > "2020-02-29" & date < "2023-01-01")
+
+pop_50to64<- casedemo %>% filter(age_grp=="50-64") %>% mutate(roll=rollmeanr(cases, 7, fill = NA)) %>% filter(date > "2020-02-29" & date < "2023-01-01")
+
+pop_65plus<- casedemo %>% filter(age_grp=="65+")%>% mutate(roll=rollmeanr(cases, 7, fill = NA)) %>% filter(date > "2020-02-29" & date < "2023-01-01")
+
+#Couple subpopulations back into list for further analysis
+popsub<-list(pop_0to4, pop_5to17, pop_18to49, pop_50to64, pop_65plus)
+```
+
+# Pull age specific hospitalization and mortality
+
+Note hospitalization and mortality data are only used to calculate period and age specific hospitalization and mortality rates. Because of the risk of identification, raw data are not provided.
+
+```{r pull-age-specific-hospitalization-and-mortality}
+#Calculate age specific hospitalization and mortality rates based on CA data
+
+covid_outcomes<-read_csv("covid_outcomes_county_age.csv")
+
+covoutcomes<-subset(covid_outcomes, covid_outcomes$date<"2023-01-08")
+
+#Summarize hospitalization and mortality by age group and variant period. Dates for each variant period are as follows
+
+#3.1.2020 - 5.31.2021 ancestral/Alpha period 456 days
+#6.1.2021 - 12.31.2021 Delta period 213 days
+#1.1.2022 - 12.31.2022 Omicron 365 days
+
+outcomesum<-covoutcomes %>%
+    mutate(period=ifelse(date < '2021-06-01', "alpha",
+                       ifelse(date >= '2021-06-01' & date < '2022-01-01', "delta", "omicron")), age_group=ifelse(age_group2 %in% c('18-29', '30-49'), '18-49', ifelse(age_group2 %in% c('65-74', '75-84', '85+'), '65+', ifelse(age_group2 %in% c('<5'), '<5', ifelse(age_group2 %in% c('50-64'), '50-64', '5-17'))))) %>%
+  group_by(period, age_group) %>%
+  summarize(cases=sum(cases), hosp_count=sum(hosp_count), death_count=sum(death_count)) %>%
+  mutate(hosp_rate=hosp_count/cases, death_rate=death_count/hosp_count)
+
+#Supplemental Figure 3 rolling hospitalizations by age group
+
+hosp<-covoutcomes %>%
+  mutate(age_group=case_when(
+    age_group2 == '<5' ~ '<5',
+    age_group2 == '5-17' ~ '5-17',
+    age_group2 %in% c('18-29', '30-49') ~ '18-49',
+    age_group2 %in% c('50-64') ~ '50-64',
+    age_group2 %in% c('65-74', '75-84', '85+') ~ '65+')) %>%
+  group_by(age_group, date) %>%
+  summarize(hosp_count=sum(hosp_count)) %>%
+  mutate(hosproll=rollsumr(hosp_count, 7, fill = NA))
+
+hosp$age_group<-factor(hosp$age_group, levels=c('<5', '5-17', '18-49', '50-64', '65+'))
+
+#Supplemental Figure 3 Weekly rolling hospital admissions by age group
+ggplot(hosp) + geom_line(aes(x=date, y=hosproll, color=age_group)) + theme_classic() + xlab("Date") + ylab("Weekly rolling (7-day right aligned) hospital admissions") + facet_grid(rows=vars(age_group)) + theme(legend.position="none") #, scales="free_y"
+```
+
+# Pull DOF 2020 population
+```{r pull-DOF-2020-population-estimate}
+dof_age_pop <- fread("dof_pop_2020_by_age.csv") %>%
+  mutate(age_group = case_when(age > 64 ~ "65+",
+                               age >= 50 ~ "50-64",
+                               age >= 18 ~ "18-49",
+                               age >= 5 ~ "5-17",
+                               age < 5 ~ "0-4")) %>%
+  group_by(age_group) %>% summarize(pop = sum(`2020`))
+```
+
+# QALY calculations using age specific time series
+
+```{r QoL-and-symptom-duration}
+#model function for calculating estimated QALYs lost 2020-2022
+model <- function(time, stocks, auxs){
+  with(as.list(c(stocks, auxs)),{
+  N<- I + R + A + H + L_s + L_mod + L_mi
+    d_DT_Infected  <- -(1-p1)*nu*(I) - (p1)*nu*(I)
+    d_DT_Recovered <- (1-p1)*nu*(I) + alpha*L_mi
+    d_DT_Acute <- (p1)*nu*(I)-p2*delta*A-p3*delta*A-p4*delta*A-p5*delta*A
+    d_DT_Hospitalized <-p2*delta*A - (1-p6)*pi*H - (pi*p6*H)
+    d_DT_Dead <- pi*p6*H
+    d_DT_Longcovid_s <-  (p3)*delta*(A)+ ((1-p6)*pi*H) - sigma*L_s
+    d_DT_Longcovid_mod <- (p4)*delta*(A) + sigma*L_s - beta*L_mod
+    d_DT_Longcovid_mild <- (p5)*delta*(A) + beta*L_mod - alpha*L_mi
+    d_DT_LC_sQALY<-L_s
+    d_DT_LC_modQALY<-L_mod
+    d_DT_LC_mildQALY<-L_mi
+    #d_DT_LC_QALY <-   (QoLsev*((p3)*delta*(A) + (QoLmod*((p4)*delta*(A) + (QoLmild*((p5)*delta*(A))
+
+    return (list(c(d_DT_Infected,
+                   d_DT_Recovered,
+                   d_DT_Acute,
+                   d_DT_Hospitalized,
+                   d_DT_Dead,
+                   d_DT_Longcovid_s,
+                   d_DT_Longcovid_mod,
+                   d_DT_Longcovid_mild,
+                   d_DT_LC_sQALY,
+                   d_DT_LC_modQALY,
+                   d_DT_LC_mildQALY)))
+  })}
+
+#iterative function for looping over 5 sub populations and time-varying proportions (p2 and p6)
+for(i in 1:5) {
+time <- seq(0, 1, by = 0.1)
+#use alpha values because t always = 1 in this part of the for loop
+
+p2_all <-c(0.016, 0.007, 0.024, 0.078, 0.222)
+p6_all <-c(0.006, 0.008, 0.085, 0.231, 0.541)
+
+parameters <- c(delta = 1/14,
+                nu= 1/14,
+                sigma = 1/40.66,
+                beta = 1/81.3,
+                alpha = 1/92,
+                pi=1/5,
+                p1 = 0.31,
+                p2= p2_all[i],
+                p3 = 0.005*(1-p2_all[i]),
+                p4 = 0.117*(1-p2_all[i]) ,
+                p5= 0.878*(1-p2_all[i]),
+                p6 =p6_all[i],
+                QoLsev= 0.395,
+                QoLmod= 0.225,
+                QoLmild= 0.045)
+
+init <- c(I=popsub[[i]]$roll[1],
+          R=0,
+          A=0,
+          H=0,
+          D=0,
+          L_s=0,
+          L_mod=0,
+          L_mi=0,
+          L_sQALY=0,
+          L_modQALY=0,
+          L_miQALY=0)
+
+#integrate using ode function from deSolve package
+
+LC_model_outage <- as.data.frame(ode(y = init, times = time, func = model, parms = parameters))
+
+#iterate over the number of days in the case data
+
+for(m in 2:(nrow(popsub[[i]]))){
+new_init<- LC_model_outage[nrow(LC_model_outage),]
+new_time<- seq(new_init$time+0.1, new_init$time+1, by = 0.1)
+
+#pulse in number of new cases into infected compartment
+
+new_init$I<- new_init$I + popsub[[i]]$cases[m]
+
+new_init<-c(I=new_init$I, R=new_init$R,  A=new_init$A, H=new_init$H, D=new_init$D, L_s=new_init$L_s, L_mod=new_init$L_mod, L_mi=new_init$L_mi, L_sQALY=new_init$L_sQALY, L_modQALY=new_init$L_modQALY, L_miQALY=new_init$L_miQALY) #convert from a df to name number for ode solver
+
+### Redefine parameters at new time step
+#redefine timestep from $out$ output
+
+time_step<-max(LC_model_outage$time)
+
+#updating proportions for time-varying values (p2 and p6) and pass to ode function again
+
+if(time_step<=456 ){
+   p2_all <-c(0.016, 0.007, 0.024, 0.078, 0.222)
+   p6_all <-c(0.006, 0.008, 0.085, 0.231, 0.541)
+} else if(time_step > 456 & time_step<=669){
+  p2_all <-c(0.015, 0.005, 0.021, 0.065, 0.167)
+  p6_all <-c(0.009, 0.009, 0.107, 0.237, 0.390)
+} else if(time_step>669){
+  p2_all <-c(0.011, 0.002, 0.007, 0.019, 0.083)
+  p6_all <-c(0.005, 0.011, 0.051, 0.159, 0.289)}
+
+#parameters from Table 1 of manuscript
+
+parameters <- c(delta = 1/14,
+                nu= 1/14,
+                sigma = 1/40.66,
+                beta = 1/81.3,
+                alpha = 1/92,
+                pi=1/5,
+                p1 = 0.31,
+                p2= p2_all[i],
+                p3 = 0.005*(1-p2_all[i]),
+                p4 = 0.117*(1-p2_all[i]) ,
+                p5= 0.878*(1-p2_all[i]),
+                p6 =p6_all[i],
+                QoLsev= 0.395,
+                QoLmod= 0.225,
+                QoLmild= 0.045)
+
+LC_model_out_new <- as.data.frame(ode(y = new_init, times = new_time, func = model, parms = parameters))
+
+LC_model_outage<- LC_model_outage %>% bind_rows(LC_model_out_new)
+}
+
+assign(paste0("LC_model", i), LC_model_outage)# %>% bind_rows(LC_model_out_new))
+
+}
+
+LC_modeltotal<-aggregate(cbind(L_sQALY*0.395/365, L_modQALY*0.225/365, L_miQALY*0.045/365, L_s*0.395/365, L_mod*0.225/365, L_mi*0.045/365) ~ time, do.call("rbind", list(LC_model1, LC_model2, LC_model3, LC_model4, LC_model5)), sum)
+
+LC_model1<-LC_model1 %>% mutate(LC_sQALY=L_sQALY*0.395/365,
+                  LC_modQALY=L_modQALY*0.225/365,
+                  LC_miQALY=L_miQALY*0.045/365)
+
+LC_model2<-LC_model2 %>% mutate(LC_sQALY=L_sQALY*0.395/365,
+                  LC_modQALY=L_modQALY*0.225/365,
+                  LC_miQALY=L_miQALY*0.045/365)
+
+LC_model3<-LC_model3 %>% mutate(LC_sQALY=L_sQALY*0.395/365,
+                  LC_modQALY=L_modQALY*0.225/365,
+                  LC_miQALY=L_miQALY*0.045/365)
+
+LC_model4<-LC_model4 %>% mutate(LC_sQALY=L_sQALY*0.395/365,
+                  LC_modQALY=L_modQALY*0.225/365,
+                  LC_miQALY=L_miQALY*0.045/365)
+
+LC_model5<-LC_model5 %>% mutate(LC_sQALY=L_sQALY*0.395/365,
+                  LC_modQALY=L_modQALY*0.225/365,
+                  LC_miQALY=L_miQALY*0.045/365)
+
+LC_modeltotal <- LC_modeltotal %>%
+  rename(L_sQALY = V1,
+         L_modQALY = V2,
+         L_miQALY = V3, inc_s=V4, inc_mod=V5, inc_mi=V6) %>%
+  mutate(mildprop=L_miQALY/(L_sQALY+L_modQALY+L_miQALY),
+         modprop=L_modQALY/(L_sQALY+L_modQALY+L_miQALY),
+         sevprop=L_sQALY/(L_sQALY+L_modQALY+L_miQALY))
+
+incQALY<- data.frame(time=LC_modeltotal$time[11:nrow(LC_modeltotal)], inc_L_sQALY=diff(LC_modeltotal$L_sQALY, lag=10), inc_L_modQALY=diff(LC_modeltotal$L_modQALY, lag=10), inc_L_miQALY=diff(LC_modeltotal$L_miQALY, lag=10)) %>% pivot_longer(!time, names_to = "Severity", values_to= "IncQALYs")
+
+LC_modeltotal %>%
+  ggplot() +
+  geom_line(aes(x = time, y = L_sQALY, col="Severe")) +
+  geom_line(aes(x = time, y = L_modQALY, col="Moderate")) +
+  geom_line(aes(x = time, y = L_miQALY, col="Mild")) +
+  theme_classic()+
+  scale_color_manual(name="QALY burden severity", labels=c('Mild', 'Moderate', 'Severe'), values=c("#00BA38", "#619CFF", "#F8766D"))+
+  ylab("Cumulative QALYs Lost to Long COVID")
+
+LC_modeltotal %>%
+  ggplot() +
+  geom_line(aes(x = time, y = inc_s, col="Severe")) +
+  geom_line(aes(x = time, y = inc_mod, col="Moderate")) +
+  geom_line(aes(x = time, y = inc_mi, col="Mild")) +
+scale_x_continuous(labels = c('3-01-20', '11-06-20', '7-14-21', '3-21-22', '11-26-22')) + theme_classic()+ scale_color_manual(name="QALY burden severity", labels=c('Mild', 'Moderate', 'Severe'), values=c("#00BA38", "#619CFF", "#F8766D")) + theme(axis.text.x = element_text(angle = 55, hjust = 1)) + xlab("Date") + ylab("Incident QALYs")
+
+#Total QALYS across all severity levels
+
+sum(LC_modeltotal %>% filter(time == max(time)) %>% select(L_miQALY,L_modQALY,L_sQALY))
+
+#59514 QALYs
+
+#QALYS for 0-4 year olds per 100,000
+sum(LC_model1$LC_miQALY[nrow(LC_model1)]+LC_model1$LC_modQALY[nrow(LC_model1)]+LC_model1$LC_sQALY[nrow(LC_model1)])/2325225 * 100000
+
+#QALYS for 5-17 year olds per 100,000
+sum(LC_model2$LC_miQALY[nrow(LC_model2)]+LC_model2$LC_modQALY[nrow(LC_model2)]+LC_model2$LC_sQALY[nrow(LC_model2)])/17464204 * 100000
+
+#QALYS for 18-49 year olds per 100,000
+sum(LC_model3$LC_miQALY[nrow(LC_model3)]+LC_model3$LC_modQALY[nrow(LC_model3)]+LC_model3$LC_sQALY[nrow(LC_model3)])/6700827 * 100000
+
+#QALYS for 50-64 year olds per 100,000
+sum(LC_model4$LC_miQALY[nrow(LC_model4)]+LC_model4$LC_modQALY[nrow(LC_model4)]+LC_model4$LC_sQALY[nrow(LC_model4)])/7390764 * 100000
+
+#QALYS for 65+ year olds per 100,000
+sum(LC_model5$LC_miQALY[nrow(LC_model5)]+LC_model5$LC_modQALY[nrow(LC_model5)]+LC_model5$LC_sQALY[nrow(LC_model5)])/6248140 * 100000
+
+#proportion mild overall
+sum(LC_model1$L_miQALY[nrow(LC_model1)]+LC_model2$L_miQALY[nrow(LC_model2)]+LC_model3$L_miQALY[nrow(LC_model3)]+LC_model4$L_miQALY[nrow(LC_model4)]+LC_model5$L_miQALY[nrow(LC_model5)])/sum(LC_model1$L_miQALY[nrow(LC_model1)]+LC_model1$L_modQALY[nrow(LC_model1)]+LC_model1$L_sQALY[nrow(LC_model1)]+LC_model2$L_miQALY[nrow(LC_model2)]+LC_model2$L_modQALY[nrow(LC_model2)]+LC_model2$L_sQALY[nrow(LC_model2)]+LC_model3$L_miQALY[nrow(LC_model3)]+LC_model3$L_modQALY[nrow(LC_model3)]+LC_model3$L_sQALY[nrow(LC_model3)]+LC_model4$L_miQALY[nrow(LC_model4)]+LC_model4$L_modQALY[nrow(LC_model4)]+LC_model4$L_sQALY[nrow(LC_model4)]+LC_model5$L_miQALY[nrow(LC_model5)]+LC_model5$L_modQALY[nrow(LC_model5)]+LC_model5$L_sQALY[nrow(LC_model5)])
+
+#proportion moderate overall
+sum(LC_model1$L_modQALY[nrow(LC_model1)]+LC_model2$L_modQALY[nrow(LC_model2)]+LC_model3$L_modQALY[nrow(LC_model3)]+LC_model4$L_modQALY[nrow(LC_model4)]+LC_model5$L_modQALY[nrow(LC_model5)])/sum(LC_model1$L_miQALY[nrow(LC_model1)]+LC_model1$L_modQALY[nrow(LC_model1)]+LC_model1$L_sQALY[nrow(LC_model1)]+LC_model2$L_miQALY[nrow(LC_model2)]+LC_model2$L_modQALY[nrow(LC_model2)]+LC_model2$L_sQALY[nrow(LC_model2)]+LC_model3$L_miQALY[nrow(LC_model3)]+LC_model3$L_modQALY[nrow(LC_model3)]+LC_model3$L_sQALY[nrow(LC_model3)]+LC_model4$L_miQALY[nrow(LC_model4)]+LC_model4$L_modQALY[nrow(LC_model4)]+LC_model4$L_sQALY[nrow(LC_model4)]+LC_model5$L_miQALY[nrow(LC_model5)]+LC_model5$L_modQALY[nrow(LC_model5)]+LC_model5$L_sQALY[nrow(LC_model5)])
+
+#proportion mild by age group
+sum(LC_model1$L_miQALY[nrow(LC_model1)])/sum(LC_model1$L_miQALY[nrow(LC_model1)]+LC_model1$L_modQALY[nrow(LC_model1)]+LC_model1$L_sQALY[nrow(LC_model1)])
+
+sum(LC_model2$L_miQALY[nrow(LC_model2)])/sum(LC_model2$L_miQALY[nrow(LC_model2)]+LC_model2$L_modQALY[nrow(LC_model2)]+LC_model2$L_sQALY[nrow(LC_model2)])
+
+sum(LC_model3$L_miQALY[nrow(LC_model3)])/sum(LC_model3$L_miQALY[nrow(LC_model3)]+LC_model3$L_modQALY[nrow(LC_model3)]+LC_model3$L_sQALY[nrow(LC_model3)])
+
+sum(LC_model4$L_miQALY[nrow(LC_model4)])/sum(LC_model4$L_miQALY[nrow(LC_model4)]+LC_model4$L_modQALY[nrow(LC_model4)]+LC_model4$L_sQALY[nrow(LC_model4)])
+
+sum(LC_model5$L_miQALY[nrow(LC_model5)])/sum(LC_model5$L_miQALY[nrow(LC_model5)]+LC_model5$L_modQALY[nrow(LC_model5)]+LC_model5$L_sQALY[nrow(LC_model5)])
+```
+
+## Figures 2 & 3
+
+```{r plots}
+######################Create legend###################
+#combine all QALYS
+
+plot_overall<-LC_modeltotal %>% select(time, L_miQALY,L_modQALY,L_sQALY) %>% pivot_longer(!time, names_to = "state", values_to = "value") %>% ggplot(aes(x=time, y=value, col=state)) + geom_line() + scale_x_continuous(labels = c('3-01-20', '11-06-20', '7-14-21', '3-21-22', '11-26-22')) + theme_classic()+ scale_color_manual(name="QALY burden severity", labels=c('Mild', 'Moderate', 'Severe'), values=c("#00BA38", "#619CFF", "#F8766D")) + theme(axis.text.x = element_text(angle = 55, hjust = 1)) + xlab("Date") + ylab("QALYs")
+
+legend <- get_legend(plot_overall)
+
+###################Data prep######################
+all_results<- LC_model1 %>%
+  mutate(age_group= "0-4") %>%
+  bind_rows(LC_model2 %>% mutate(age_group= "5-17"),
+            LC_model3 %>% mutate(age_group= "18-49"),
+            LC_model4 %>% mutate(age_group= "50-64"),
+            LC_model5 %>% mutate(age_group= "65+")) %>%
+  mutate(propmild=LC_miQALY/(LC_miQALY+LC_modQALY+LC_sQALY)) %>%
+  pivot_longer(!c(time, age_group), names_to = "state", values_to = "value")
+
+all_results$age_group<- factor(all_results$age_group, levels = c("0-4", "5-17", "18-49", "50-64", "65+"))
+
+prop_QALYS<- all_results %>% filter(state %in% c("L_sQALY", "L_modQALY",  "L_miQALY"))
+
+cumQALYS<- all_results %>% filter(state %in% c("time", "LC_miQALY", "LC_modQALY", "LC_sQALY"))
+
+###################Figure 2 plots#####################
+
+Fig2A<-LC_modeltotal %>%
+  ggplot() +
+  geom_line(aes(x = time, y = inc_s, col="Severe")) +
+  geom_line(aes(x = time, y = inc_mod, col="Moderate")) +
+  geom_line(aes(x = time, y = inc_mi, col="Mild")) +
+scale_x_continuous(labels = c('3-01-20', '11-06-20', '7-14-21', '3-21-22', '11-26-22')) + theme_classic()+ scale_color_manual(name="QALY burden severity", labels=c('Mild', 'Moderate', 'Severe'), values=c("#00BA38", "#619CFF", "#F8766D")) + theme(axis.text.x = element_text(angle = 55, hjust = 1)) + theme(legend.position="none")+ xlab("Date") + ylab("Incident QALYs")
+
+Fig2B<-prop_QALYS %>% ggplot()+
+  geom_area(aes(x=time, y=value, fill=state), position="fill")+
+  theme_classic() +
+  theme(legend.position="none", axis.text.x = element_text(angle = 55, hjust = 1))+
+  scale_x_continuous(labels = c('3-01-20', '11-06-20', '7-14-21', '3-21-22', '11-26-22'))+
+  scale_fill_manual(labels=c('Mild', 'Moderate', 'Severe'), values=c("#00BA38", "#619CFF", "#F8766D")) +
+  ylab("Proportion of Cumulative QALYs")+ xlab("Date")
+
+Fig2grid<-plot_grid(Fig2B, Fig2A, labels=c('A', 'B'), label_x=0.5)
+
+plot_grid(Fig2grid, legend, ncol=2, rel_widths = c(1, 0.15))
+
+######################Figure 3 plots#####################
+
+Fig3A<-prop_QALYS %>% ggplot()+
+  facet_wrap(age_group ~.)+
+  geom_area(aes(x=time, y=value, fill=state), position="fill")+
+  theme_classic() +
+  theme(legend.position="none", axis.text.x = element_text(angle = 55, hjust = 1))+
+  scale_x_continuous(labels = c('3-01-20', '11-06-20', '7-14-21', '3-21-22', '11-26-22'))+
+  scale_fill_manual(labels=c('Mild', 'Moderate', 'Severe'), values=c("#00BA38", "#619CFF", "#F8766D")) +
+  ylab("Proportion of QALYs")+ xlab("Date")
+
+Fig3B<-cumQALYS %>% ggplot()+
+  facet_wrap(age_group ~.)+
+  geom_line(aes(x=time, y=value, col=state))+
+  theme_classic()+
+scale_x_continuous(labels = c('3-01-20', '11-06-20', '7-14-21', '3-21-22', '11-26-22'))+theme_classic() + theme(legend.position="none",  axis.text.x = element_text(angle = 55, hjust = 1))+ scale_color_manual(labels=c('Mild', 'Moderate', 'Severe'), values=c("#00BA38", "#619CFF", "#F8766D"))+ ylab("Cumulative QALYs")+
+  xlab("Date")
+
+Fig3grid<-plot_grid(Fig3A, Fig3B, labels="AUTO", ncol=1)
+
+plot_grid(Fig3grid, legend, ncol=2, rel_widths = c(1, 0.18))
+```
+
+# Sensitivity analysis (LHS and PRCC)
+```{r LHS-age-specific-parameters}
+lhs<-maximinLHS(1000, 23) #n=1000 for number of draws
+lhs[,1]<- qtriangle(lhs[,1], 0.09, 0.53, 0.31) #p1
+lhs[,2]<- qunif(lhs[,2], 0.005, 0.016) #p2 0-4
+lhs[,3]<- qunif(lhs[,3], 0.002, 0.007) #p2 5-17
+lhs[,4]<- qunif(lhs[,4], 0.007, 0.024) #p2 18-49
+lhs[,5]<- qunif(lhs[,5], 0.019, 0.078) #p2 50-64
+lhs[,6]<- qunif(lhs[,6], 0.083, 0.222) #p2 65+
+lhs[,7]<- qunif(lhs[,7], 0.0025, 0.0075) #p3
+lhs[,8]<- qunif(lhs[,8], 0.0585, 0.175) #p4
+lhs[,9]<- qunif(lhs[,9], 0.439, 0.99) #p5
+lhs[,10]<- qunif(lhs[,10], 0.006, 0.009) #p6 0-4
+lhs[,11]<- qunif(lhs[,11], 0.008, 0.011) #p6 5-17
+lhs[,12]<- qunif(lhs[,12], 0.051, 0.107) #p6 18-49
+lhs[,13]<- qunif(lhs[,13], 0.159, 0.237) #p6 50-64
+lhs[,14]<- qunif(lhs[,14], 0.289, 0.541) #p6 65+
+lhs[,15]<- qunif(lhs[,15], 0.035, 0.145) #nu
+lhs[,16]<- qunif(lhs[,16], 0.01, 0.07) #delta
+lhs[,17]<- qunif(lhs[,17], 0.16, 0.25) #pi
+lhs[,18]<- qunif(lhs[,18], 0.01, 0.02) #sigma
+lhs[,19]<- qunif(lhs[,19], 0.01, 0.02) #beta
+lhs[,20]<- qunif(lhs[,20], 0.009, 0.0125) #alpha
+lhs[,21]<- qunif(lhs[,21], 0, 0.10) #QoL mild
+lhs[,22]<- qunif(lhs[,22], 0.15, 0.31) #QoL moderate
+lhs[,23]<- qunif(lhs[,23], 0.2, 0.59) #QoL severe
+
+lhs <- as.data.frame(lhs)
+
+parameternames<- c("p1", "p2.04", "p2.517", "p2.1849", "p2.5064", "p2.65", "p3", "p4", "p5", "p6.04", "p6.517", "p6.1849", "p6.5064", "p6.65", "nu", "delta", "pi", "sigma", "beta", "alpha", "QoLmild", "QoLmod", "QoLsev")
+
+colnames(lhs) <- c(parameternames)
+
+scenario2 <- data.frame(matrix(rep(NA,10),nrow=1000, ncol= ncol(lhs)+19))
+
+colnames(scenario2)<-c(parameternames, "CumSevQALY0to4", "CumModQALY0to4", "CumMildQALY0to4", "CumSevQALY5to17", "CumModQALY5to17", "CumMildQALY5to17", "CumSevQALY18to49", "CumModQALY18to49", "CumMildQALY18to49", "CumSevQALY50to64", "CumModQALY50to64", "CumMildQALY50to64", "CumSevQALY65+", "CumModQALY65+", "CumMildQALY65+", "CumSevAll", "CumModAll", "CumMildAll", "TotalBurden")
+
+#how long to integrate over, ie time interval
+time <- seq(0, 1, by = 0.1)
+
+#set initial values for each subpopulation
+init <- c(I_0to4=popsub[[1]]$roll[1],
+          R_0to4=0,
+          A_0to4=0,
+          H_0to4=0,
+          D_0to4=0,
+          L_s_0to4=0,
+          L_mod_0to4=0,
+          L_mi_0to4=0,
+          L_sQALY0to4=0,
+          L_modQALY0to4=0,
+          L_miQALY0to4=0,
+          I_5to17=popsub[[2]]$roll[1],
+          R_5to17=0,
+          A_5to17=0,
+          H_5to17=0,
+          D_5to17=0,
+          L_s_5to17=0,
+          L_mod_5to17=0,
+          L_mi_5to17=0,
+          L_sQALY5to17=0,
+          L_modQALY5to17=0,
+          L_miQALY5to17=0,
+          I_18to49=popsub[[3]]$roll[1],
+          R_18to49=0,
+          A_18to49=0,
+          H_18to49=0,
+          D_18to49=0,
+          L_s_18to49=0,
+          L_mod_18to49=0,
+          L_mi_18to49=0,
+          L_sQALY18to49=0,
+          L_modQALY18to49=0,
+          L_miQALY18to49=0,
+          I_50to64=popsub[[4]]$roll[1],
+          R_50to64=0,
+          A_50to64=0,
+          H_50to64=0,
+          D_50to64=0,
+          L_s_50to64=0,
+          L_mod_50to64=0,
+          L_mi_50to64=0,
+          L_sQALY50to64=0,
+          L_modQALY50to64=0,
+          L_miQALY50to64=0,
+          I_65=popsub[[5]]$roll[1],
+          R_65=0,
+          A_65=0,
+          H_65=0,
+          D_65=0,
+          L_s_65=0,
+          L_mod_65=0,
+          L_mi_65=0,
+          L_sQALY65=0,
+          L_modQALY65=0,
+          L_miQALY65=0)
+
+#ode function for LHS
+modellhs <- function(time, stocks, auxs){
+  with(as.list(c(stocks, auxs)),{
+  N<- I_0to4 + R_0to4 + A_0to4 + H_0to4 + L_s_0to4 + L_mod_0to4 + L_mi_0to4 + I_5to17 + R_5to17 + A_5to17 + H_5to17 + L_s_5to17 + L_mod_5to17 + L_mi_5to17 +I_18to49 + R_18to49 + A_18to49 + H_18to49 + L_s_18to49 + L_mod_18to49 + L_mi_18to49 + I_50to64 + R_50to64 + A_50to64 + H_50to64 + L_s_50to64 + L_mod_50to64 + L_mi_50to64 + I_65 + R_65 + A_65 + H_65 + L_s_65 + L_mod_65 + L_mi_65
+
+    d_DT_Infected0to4  <- -(1-p1)*nu*(I_0to4) - (p1)*nu*(I_0to4)
+    d_DT_Recovered0to4 <- (1-p1)*nu*(I_0to4) + alpha*L_mi_0to4
+    d_DT_Acute0to4 <- (p1)*nu*(I_0to4)-p2.04*delta*A_0to4-p3*delta*A_0to4-p4*delta*A_0to4-p5*delta*A_0to4
+    d_DT_Hospitalized0to4 <-p2.04*delta*A_0to4 - (1-p6.04)*pi*H_0to4 - (pi*p6.04*H_0to4)
+    d_DT_Dead0to4 <- pi*p6.04*H_0to4
+    d_DT_Longcovid_s0to4 <-  (p3)*delta*(A_0to4)+ ((1-p6.04)*pi*H_0to4) - sigma*L_s_0to4
+    d_DT_Longcovid_mod0to4 <- (p4)*delta*(A_0to4) + sigma*L_s_0to4 - beta*L_mod_0to4
+    d_DT_Longcovid_mild0to4 <- (p5)*delta*(A_0to4) + beta*L_mod_0to4 - alpha*L_mi_0to4
+    d_DT_LC_sQALY0to4 <- L_s_0to4
+    d_DT_LC_modQALY0to4<- L_mod_0to4
+    d_DT_LC_mildQALY0to4<- L_mi_0to4
+
+    d_DT_Infected5to17  <- -(1-p1)*nu*(I_5to17) - (p1)*nu*(I_5to17)
+    d_DT_Recovered5to17 <- (1-p1)*nu*(I_5to17) + alpha*L_mi_5to17
+    d_DT_Acute5to17 <- (p1)*nu*(I_5to17)-p2.517*delta*A_5to17-p3*delta*A_5to17-p4*delta*A_5to17-p5*delta*A_5to17
+    d_DT_Hospitalized5to17 <-p2.517*delta*A_5to17 - (1-p6.517)*pi*H_5to17 - (pi*p6.517*H_5to17)
+    d_DT_Dead5to17 <- pi*p6.517*H_5to17
+    d_DT_Longcovid_s5to17 <-  (p3)*delta*(A_5to17)+ ((1-p6.517)*pi*H_5to17) - sigma*L_s_5to17
+    d_DT_Longcovid_mod5to17 <- (p4)*delta*(A_5to17) + sigma*L_s_5to17 - beta*L_mod_5to17
+    d_DT_Longcovid_mild5to17 <- (p5)*delta*(A_5to17) + beta*L_mod_5to17 - alpha*L_mi_5to17
+    d_DT_LC_sQALY5to17 <-L_s_5to17
+    d_DT_LC_modQALY5to17<- L_mod_5to17
+    d_DT_LC_mildQALY5to17<- L_mi_5to17
+
+        d_DT_Infected18to49  <- -(1-p1)*nu*(I_18to49) - (p1)*nu*(I_18to49)
+    d_DT_Recovered18to49 <- (1-p1)*nu*(I_18to49) + alpha*L_mi_18to49
+    d_DT_Acute18to49 <- (p1)*nu*(I_18to49)-p2.1849*delta*A_18to49-p3*delta*A_18to49-p4*delta*A_18to49-p5*delta*A_18to49
+    d_DT_Hospitalized18to49 <-p2.1849*delta*A_18to49 - (1-p6.1849)*pi*H_18to49 - (pi*p6.1849*H_18to49)
+    d_DT_Dead18to49 <- pi*p6.1849*H_18to49
+    d_DT_Longcovid_s18to49 <-  (p3)*delta*(A_18to49)+ ((1-p6.1849)*pi*H_18to49) - sigma*L_s_18to49
+    d_DT_Longcovid_mod18to49 <- (p4)*delta*(A_18to49) + sigma*L_s_18to49 - beta*L_mod_18to49
+    d_DT_Longcovid_mild18to49 <- (p5)*delta*(A_18to49) + beta*L_mod_18to49 - alpha*L_mi_18to49
+    d_DT_LC_sQALY18to49 <- L_s_18to49
+    d_DT_LC_modQALY18to49<- L_mod_18to49
+    d_DT_LC_mildQALY18to49<- L_mi_18to49
+
+        d_DT_Infected50to64  <- -(1-p1)*nu*(I_50to64) - (p1)*nu*(I_50to64)
+    d_DT_Recovered50to64 <- (1-p1)*nu*(I_50to64) + alpha*L_mi_50to64
+    d_DT_Acute50to64 <- (p1)*nu*(I_50to64)-p2.5064*delta*A_50to64-p3*delta*A_50to64-p4*delta*A_50to64-p5*delta*A_50to64
+    d_DT_Hospitalized50to64 <-p2.5064*delta*A_50to64 - (1-p6.5064)*pi*H_50to64 - (pi*p6.5064*H_50to64)
+    d_DT_Dead50to64 <- pi*p6.5064*H_50to64
+    d_DT_Longcovid_s50to64 <-  (p3)*delta*(A_50to64)+ ((1-p6.5064)*pi*H_50to64) - sigma*L_s_50to64
+    d_DT_Longcovid_mod50to64 <- (p4)*delta*(A_50to64) + sigma*L_s_50to64 - beta*L_mod_50to64
+    d_DT_Longcovid_mild50to64 <- (p5)*delta*(A_50to64) + beta*L_mod_50to64 - alpha*L_mi_50to64
+    d_DT_LC_sQALY50to64 <- L_s_50to64
+    d_DT_LC_modQALY50to64<- L_mod_50to64
+    d_DT_LC_mildQALY50to64<- L_mi_50to64
+
+        d_DT_Infected65  <- -(1-p1)*nu*(I_65) - (p1)*nu*(I_65)
+    d_DT_Recovered65 <- (1-p1)*nu*(I_65) + alpha*L_mi_65
+    d_DT_Acute65 <- (p1)*nu*(I_65)-p2.65*delta*A_65-p3*delta*A_65-p4*delta*A_65-p5*delta*A_65
+    d_DT_Hospitalized65 <-p2.65*delta*A_65 - (1-p6.65)*pi*H_65 - (pi*p6.65*H_65)
+    d_DT_Dead65 <- pi*p6.65*H_65
+    d_DT_Longcovid_s65 <-  (p3)*delta*(A_65)+ ((1-p6.65)*pi*H_65) - sigma*L_s_65
+    d_DT_Longcovid_mod65 <- (p4)*delta*(A_65) + sigma*L_s_65 - beta*L_mod_65
+    d_DT_Longcovid_mild65 <- (p5)*delta*(A_65) + beta*L_mod_65 - alpha*L_mi_65
+    d_DT_LC_sQALY65 <-L_s_65
+    d_DT_LC_modQALY65<- L_mod_65
+    d_DT_LC_mildQALY65<- L_mi_65
+
+    return (list(c(d_DT_Infected0to4,
+                   d_DT_Recovered0to4,
+                   d_DT_Acute0to4,
+                   d_DT_Hospitalized0to4,
+                   d_DT_Dead0to4,
+                   d_DT_Longcovid_s0to4,
+                   d_DT_Longcovid_mod0to4,
+                   d_DT_Longcovid_mild0to4,
+                   d_DT_LC_sQALY0to4,
+                   d_DT_LC_modQALY0to4,
+                   d_DT_LC_mildQALY0to4,
+                   d_DT_Infected5to17,
+                   d_DT_Recovered5to17,
+                   d_DT_Acute5to17,
+                   d_DT_Hospitalized5to17,
+                   d_DT_Dead5to17,
+                   d_DT_Longcovid_s5to17,
+                   d_DT_Longcovid_mod5to17,
+                   d_DT_Longcovid_mild5to17,
+                   d_DT_LC_sQALY5to17,
+                   d_DT_LC_modQALY5to17,
+                   d_DT_LC_mildQALY5to17,
+                   d_DT_Infected18to49,
+                   d_DT_Recovered18to49,
+                   d_DT_Acute18to49,
+                   d_DT_Hospitalized18to49,
+                   d_DT_Dead18to49,
+                   d_DT_Longcovid_s18to49,
+                   d_DT_Longcovid_mod18to49,
+                   d_DT_Longcovid_mild18to49,
+                   d_DT_LC_sQALY18to49,
+                   d_DT_LC_modQALY18to49,
+                   d_DT_LC_mildQALY18to49,
+                   d_DT_Infected50to64,
+                   d_DT_Recovered50to64,
+                   d_DT_Acute50to64,
+                   d_DT_Hospitalized50to64,
+                   d_DT_Dead50to64,
+                   d_DT_Longcovid_s50to64,
+                   d_DT_Longcovid_mod50to64,
+                   d_DT_Longcovid_mild50to64,
+                   d_DT_LC_sQALY50to64,
+                   d_DT_LC_modQALY50to64,
+                   d_DT_LC_mildQALY50to64,
+                   d_DT_Infected65,
+                   d_DT_Recovered65,
+                   d_DT_Acute65,
+                   d_DT_Hospitalized65,
+                   d_DT_Dead65,
+                   d_DT_Longcovid_s65,
+                   d_DT_Longcovid_mod65,
+                   d_DT_Longcovid_mild65,
+                   d_DT_LC_sQALY65,
+                   d_DT_LC_modQALY65,
+                   d_DT_LC_mildQALY65)))
+  })
+
+}
+
+#loop that cycles through the parameter combinations in lhs dataframe
+
+for(n in 1:nrow(lhs)){
+  scenario2[n, 1:length(parameternames)] <- params <- as.list(c(lhs[n,]))
+  out <- as.data.frame(ode(init, time, modellhs, params))
+
+#at each time step new infected cases are added in and saved as new inits 
+
+#integrate using ode function from deSolve package
+
+for(i in 2:nrow(popsub[[1]])){
+  new_init<- out[nrow(out),]
+  new_time<- seq(new_init$time+0.1, new_init$time+1, by = 0.1)
+  new_init$I_0to4<- new_init$I_0to4 + popsub[[1]]$roll[i]
+  new_init$I_5to17<- new_init$I_5to17 + popsub[[2]]$roll[i]
+  new_init$I_18to49<- new_init$I_18to49 + popsub[[3]]$roll[i]
+  new_init$I_50to64<- new_init$I_50to64 + popsub[[4]]$roll[i]
+  new_init$I_65<- new_init$I_65 + popsub[[5]]$roll[i]
+
+  new_init<-c(I_0to4=new_init$I_0to4,
+              R_0to4=new_init$R_0to4, 
+              A_0to4=new_init$A_0to4,
+              H_0to4=new_init$H_0to4,
+              D_0to4=new_init$D_0to4, 
+              L_s_0to4=new_init$L_s_0to4,
+              L_mod_0to4=new_init$L_mod_0to4,
+              L_mi_0to4=new_init$L_mi_0to4,
+              L_sQALY0to4=new_init$L_sQALY0to4,
+              L_modQALY0to4=new_init$L_modQALY0to4,
+              L_miQALY0to4=new_init$L_miQALY0to4,
+              I_5to17=new_init$I_5to17,
+              R_5to17=new_init$R_5to17, 
+              A_5to17=new_init$A_5to17,
+              H_5to17=new_init$H_5to17,
+              D_5to17=new_init$D_5to17, 
+              L_s_5to17=new_init$L_s_5to17,
+              L_mod_5to17=new_init$L_mod_5to17,
+              L_mi_5to17=new_init$L_mi_5to17,
+              L_sQALY5to17=new_init$L_sQALY5to17,
+              L_modQALY5to17=new_init$L_modQALY5to17,
+              L_miQALY5to17=new_init$L_miQALY5to17,
+              I_18to49=new_init$I_18to49,
+              R_18to49=new_init$R_18to49, 
+              A_18to49=new_init$A_18to49,
+              H_18to49=new_init$H_18to49,
+              D_18to49=new_init$D_18to49, 
+              L_s_18to49=new_init$L_s_18to49,
+              L_mod_18to49=new_init$L_mod_18to49,
+              L_mi_18to49=new_init$L_mi_18to49,
+              L_sQALY18to49=new_init$L_sQALY18to49,
+              L_modQALY18to49=new_init$L_modQALY18to49,
+              L_miQALY18to49=new_init$L_miQALY18to49,
+              I_50to64=new_init$I_50to64,
+              R_50to64=new_init$R_50to64, 
+              A_50to64=new_init$A_50to64,
+              H_50to64=new_init$H_50to64,
+              D_50to64=new_init$D_50to64, 
+              L_s_50to64=new_init$L_s_50to64,
+              L_mod_50to64=new_init$L_mod_50to64,
+              L_mi_50to64=new_init$L_mi_50to64,
+              L_sQALY50to64=new_init$L_sQALY50to64,
+              L_modQALY50to64=new_init$L_modQALY50to64,
+              L_miQALY50to64=new_init$L_miQALY50to64,
+              I_65=new_init$I_65,
+              R_65=new_init$R_65, 
+              A_65=new_init$A_65,
+              H_65=new_init$H_65,
+              D_65=new_init$D_65, 
+              L_s_65=new_init$L_s_65,
+              L_mod_65=new_init$L_mod_65,
+              L_mi_65=new_init$L_mi_65,
+              L_sQALY65=new_init$L_sQALY65,
+              L_modQALY65=new_init$L_modQALY65,
+              L_miQALY65=new_init$L_miQALY65)
+
+out_new <- as.data.frame(ode(new_init, new_time, modellhs, parms = params))
+#bind new iterations to out dataframe
+
+out<- out %>% bind_rows(out_new)
+}
+
+#after looping through all time steps for a given parameter combination (n), capture output
+
+#make sure to convert QALDs to years by dividing by 365
+
+  scenario2[n, length(parameternames)+1] <- max(out$L_sQALY0to4)*scenario2$QoLsev[n]/365
+  scenario2[n, length(parameternames)+2] <- max(out$L_modQALY0to4)*scenario2$QoLmod[n]/365
+  scenario2[n, length(parameternames)+3] <- max(out$L_miQALY0to4)*scenario2$QoLmild[n]/365
+  scenario2[n, length(parameternames)+4] <- max(out$L_sQALY5to17)*scenario2$QoLsev[n]/365
+  scenario2[n, length(parameternames)+5] <- max(out$L_modQALY5to17)*scenario2$QoLmod[n]/365
+  scenario2[n, length(parameternames)+6] <- max(out$L_miQALY5to17)*scenario2$QoLmild[n]/365
+  scenario2[n, length(parameternames)+7] <- max(out$L_sQALY18to49)*scenario2$QoLsev[n]/365
+  scenario2[n, length(parameternames)+8] <- max(out$L_modQALY18to49)*scenario2$QoLmod[n]/365
+  scenario2[n, length(parameternames)+9] <- max(out$L_miQALY18to49)*scenario2$QoLmild[n]/365
+  scenario2[n, length(parameternames)+10] <- max(out$L_sQALY50to64)*scenario2$QoLsev[n]/365
+  scenario2[n, length(parameternames)+11] <- max(out$L_modQALY50to64)*scenario2$QoLmod[n]/365
+  scenario2[n, length(parameternames)+12] <- max(out$L_miQALY50to64)*scenario2$QoLmild[n]/365
+  scenario2[n, length(parameternames)+13] <- max(out$L_sQALY65)*scenario2$QoLsev[n]/365
+  scenario2[n, length(parameternames)+14] <- max(out$L_modQALY65)*scenario2$QoLmod[n]/365
+  scenario2[n, length(parameternames)+15] <- max(out$L_miQALY65)*scenario2$QoLmild[n]/365
+  scenario2[n, length(parameternames)+16] <- (max(out$L_sQALY0to4)+max(out$L_sQALY5to17)+max(out$L_sQALY18to49)+max(out$L_sQALY50to64)+max(out$L_sQALY65))*scenario2$QoLsev[n]/365 #Cumulative severe QALYS
+  scenario2[n, length(parameternames)+17] <- (max(out$L_modQALY0to4)+max(out$L_modQALY5to17)+max(out$L_modQALY18to49)+max(out$L_modQALY50to64)+max(out$L_modQALY65))*scenario2$QoLmod[n]/365 #Cumulative moderate QALYS
+ scenario2[n, length(parameternames)+18] <- (max(out$L_miQALY0to4)+max(out$L_miQALY5to17)+max(out$L_miQALY18to49)+max(out$L_miQALY50to64)+max(out$L_miQALY65))*scenario2$QoLmild[n]/365 #Cumulative mild QALYS
+  scenario2[n, length(parameternames)+19] <- scenario2$CumSevAll[n] + scenario2$CumModAll[n] + scenario2$CumMildAll[n] #Range of total QALYS
+}
+
+summary(scenario2$CumSevAll+scenario2$CumModAll+scenario2$CumMildAll)
+
+#min 15,966, max 110,990
+write.csv(scenario2, "scenariooutput.csv")
+```
+
+## PRCC
+Figure 4
+
+```{r PRCC}
+#plot correlation coefficients cumulative severe QALYS
+
+bonferroni.alpha <- 0.05/length(parameternames)
+prcc_sizesev <- pcc(scenario2[,1:length(parameternames)], scenario2$CumSevAll, nboot = 100, rank=TRUE, conf=1-bonferroni.alpha)
+
+sizesev<-prcc_sizesev$PRCC
+sizesev$param<-rownames(sizesev)
+colnames(sizesev)[4:5] <- c("maxCI", "minCI")
+sizesev$maxCI[which(sizesev$maxCI>1)]<-1
+sizesev$maxCI[which(sizesev$maxCI< -1)]<- -1
+sizesev$minCI[which(sizesev$minCI>1)]<-1
+sizesev$minCI[which(sizesev$minCI< -1)]<- -1
+
+A<- ggplot(sizesev, aes(x=param, y = original)) +
+  geom_point(size = 4)+
+  geom_errorbar(aes(ymax = maxCI, ymin = minCI))+
+  ggtitle("Cumulative severe QALYS")+
+  xlab("Model Parameters")+
+  ylab ("Partial Rank Correlation Coefficients")+
+  scale_x_discrete(labels=expression(alpha, beta, delta, nu, "p1", p2[0-4], p2[5-17], p2[18-49], p2[50-64], p2["65+"], "p3", "p4", "p5", p6[0-4], p6[5-17], p6[18-49], p6[50-64], p6["65+"], pi, QoL[mild], QoL[mod], Qol[sev], sigma)) +
+  ylim(-1,1)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+
+#plot correlation coefficients cumulative moderate QALYS
+prcc_sizemod <- pcc(scenario2[,1:length(parameternames)], scenario2$CumModAll, nboot = 100, rank=TRUE, conf=1-bonferroni.alpha)
+
+sizemod<-prcc_sizemod$PRCC
+sizemod$param<-rownames(sizemod)
+colnames(sizemod)[4:5] <- c("maxCI", "minCI")
+sizemod$maxCI[which(sizemod$maxCI>1)]<-1
+sizemod$maxCI[which(sizemod$maxCI< -1)]<- -1
+sizemod$minCI[which(sizemod$minCI>1)]<-1
+sizemod$minCI[which(sizemod$minCI< -1)]<- -1
+
+B<- ggplot(sizemod, aes(x=param, y = original)) +
+  geom_point(size = 4)+
+  geom_errorbar(aes(ymax = maxCI, ymin = minCI))+
+  ggtitle("Cumulative moderate QALYS")+
+  xlab("Model Parameters")+
+  ylab ("Partial Rank Correlation Coefficients")+
+  scale_x_discrete(labels=expression(alpha, beta, delta, nu, "p1", p2[0-4], p2[5-17], p2[18-49], p2[50-64], p2["65+"], "p3", "p4", "p5", p6[0-4], p6[5-17], p6[18-49], p6[50-64], p6["65+"], pi, QoL[mild], QoL[mod], Qol[sev], sigma)) +
+  ylim(-1,1)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+
+#plot correlation coefficients cumulative mild QALYS
+prcc_sizemild <- pcc(scenario2[,1:length(parameternames)], scenario2$CumMildAll, nboot = 100, rank=TRUE, conf=1-bonferroni.alpha)
+
+sizemild<-prcc_sizemild$PRCC
+sizemild$param<-rownames(sizemild)
+colnames(sizemild)[4:5] <- c("maxCI", "minCI")
+sizemild$maxCI[which(sizemild$maxCI>1)]<-1
+sizemild$maxCI[which(sizemild$maxCI< -1)]<- -1
+sizemild$minCI[which(sizemild$minCI>1)]<-1
+sizemild$minCI[which(sizemild$minCI< -1)]<- -1
+
+C<- ggplot(sizemild, aes(x=param, y = original)) +
+  geom_point(size = 4)+
+  geom_errorbar(aes(ymax = maxCI, ymin = minCI))+
+  ggtitle("Cumulative mild QALYS")+
+  xlab("Model Parameters")+
+  ylab ("Partial Rank Correlation Coefficients")+
+  scale_x_discrete(labels=expression(alpha, beta, delta, nu, "p1", p2[0-4], p2[5-17], p2[18-49], p2[50-64], p2["65+"], "p3", "p4", "p5", p6[0-4], p6[5-17], p6[18-49], p6[50-64], p6["65+"], pi, QoL[mild], QoL[mod], Qol[sev], sigma)) +
+  ylim(-1,1)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+
+plot_grid(C, B, A, labels = c('A', 'B', 'C'))
+
+#plot correlation coefficients by age (eFigure 2)
+#max severe 0-4
+bonferroni.alpha <- 0.05/length(parameternames)
+
+prcc_sizesev <- pcc(scenario2[,1:length(parameternames)], scenario2$CumSevQALY0to4, nboot = 100, rank=TRUE, conf=1-bonferroni.alpha)
+
+sizesev<-prcc_sizesev$PRCC
+sizesev$param<-rownames(sizesev)
+colnames(sizesev)[4:5] <- c("maxCI", "minCI")
+sizesev$maxCI[which(sizesev$maxCI>1)]<-1
+sizesev$maxCI[which(sizesev$maxCI< -1)]<- -1
+sizesev$minCI[which(sizesev$minCI>1)]<-1
+sizesev$minCI[which(sizesev$minCI< -1)]<- -1
+
+C04<- ggplot(sizesev, aes(x=param, y = original)) +
+  geom_point(size = 4)+
+  geom_errorbar(aes(ymax = maxCI, ymin = minCI))+
+  ggtitle("Cumulative severe QALYS 0-4")+
+  xlab("Parameters")+
+  ylab ("Partial Rank Correlation Coefficients")+
+  scale_x_discrete(labels=expression(alpha, beta, delta, nu, "p1", p2[0-4], p2[5-17], p2[18-49], p2[50-64], p2["65+"], "p3", "p4", "p5", p6[0-4], p6[5-17], p6[18-49], p6[50-64], p6["65+"], pi, QoL[mild], QoL[mod], Qol[sev], sigma)) +
+  ylim(-1,1)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+
+#plot correlation coefficients moderate QALYS 0-4
+prcc_sizemod <- pcc(scenario2[,1:length(parameternames)], scenario2$CumModQALY0to4, nboot = 100, rank=TRUE, conf=1-bonferroni.alpha)
+
+sizemod<-prcc_sizemod$PRCC
+sizemod$param<-rownames(sizemod)
+colnames(sizemod)[4:5] <- c("maxCI", "minCI")
+sizemod$maxCI[which(sizemod$maxCI>1)]<-1
+sizemod$maxCI[which(sizemod$maxCI< -1)]<- -1
+sizemod$minCI[which(sizemod$minCI>1)]<-1
+sizemod$minCI[which(sizemod$minCI< -1)]<- -1
+
+B04<- ggplot(sizemod, aes(x=param, y = original)) +
+  geom_point(size = 4)+
+  geom_errorbar(aes(ymax = maxCI, ymin = minCI))+
+  ggtitle("Cumulative moderate QALYS 0-4")+
+  xlab("Parameters")+
+  ylab ("Partial Rank Correlation Coefficients")+
+  scale_x_discrete(labels=expression(alpha, beta, delta, nu, "p1", p2[0-4], p2[5-17], p2[18-49], p2[50-64], p2["65+"], "p3", "p4", "p5", p6[0-4], p6[5-17], p6[18-49], p6[50-64], p6["65+"], pi, QoL[mild], QoL[mod], Qol[sev], sigma)) +
+  ylim(-1,1)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+
+#mild QALYS 0-4
+prcc_sizemild <- pcc(scenario2[,1:length(parameternames)], scenario2$CumMildQALY0to4, nboot = 100, rank=TRUE, conf=1-bonferroni.alpha)
+sizemild<-prcc_sizemild$PRCC
+sizemild$param<-rownames(sizemild)
+colnames(sizemild)[4:5] <- c("maxCI", "minCI")
+sizemild$maxCI[which(sizemild$maxCI>1)]<-1
+sizemild$maxCI[which(sizemild$maxCI< -1)]<- -1
+sizemild$minCI[which(sizemild$minCI>1)]<-1
+sizemild$minCI[which(sizemild$minCI< -1)]<- -1
+
+A04<- ggplot(sizemild, aes(x=param, y = original)) +
+  geom_point(size = 4)+
+  geom_errorbar(aes(ymax = maxCI, ymin = minCI))+
+  ggtitle("Cumulative mild QALYS 0-4")+
+  xlab("Parameters")+
+  ylab ("Partial Rank Correlation Coefficients")+
+  scale_x_discrete(labels=expression(alpha, beta, delta, nu, "p1", p2[0-4], p2[5-17], p2[18-49], p2[50-64], p2["65+"], "p3", "p4", "p5", p6[0-4], p6[5-17], p6[18-49], p6[50-64], p6["65+"], pi, QoL[mild], QoL[mod], Qol[sev], sigma)) +
+  ylim(-1,1)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+
+#max severe 5-17
+prcc_sizesev <- pcc(scenario2[,1:length(parameternames)], scenario2$CumSevQALY5to17, nboot = 100, rank=TRUE, conf=1-bonferroni.alpha)
+
+sizesev<-prcc_sizesev$PRCC
+sizesev$param<-rownames(sizesev)
+colnames(sizesev)[4:5] <- c("maxCI", "minCI")
+sizesev$maxCI[which(sizesev$maxCI>1)]<-1
+sizesev$maxCI[which(sizesev$maxCI< -1)]<- -1
+sizesev$minCI[which(sizesev$minCI>1)]<-1
+sizesev$minCI[which(sizesev$minCI< -1)]<- -1
+
+F<- ggplot(sizesev, aes(x=param, y = original)) +
+  geom_point(size = 4)+
+  geom_errorbar(aes(ymax = maxCI, ymin = minCI))+
+  ggtitle("Cumulative severe QALYS 5-17")+
+  xlab("Parameters")+
+  ylab ("Partial Rank Correlation Coefficients")+
+  scale_x_discrete(labels=expression(alpha, beta, delta, nu, "p1", p2[0-4], p2[5-17], p2[18-49], p2[50-64], p2["65+"], "p3", "p4", "p5", p6[0-4], p6[5-17], p6[18-49], p6[50-64], p6["65+"], pi, QoL[mild], QoL[mod], Qol[sev], sigma)) +
+  ylim(-1,1)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+
+#moderate QALYS 5-17
+prcc_sizemod <- pcc(scenario2[,1:length(parameternames)], scenario2$CumModQALY5to17, nboot = 100, rank=TRUE, conf=1-bonferroni.alpha)
+
+sizemod<-prcc_sizemod$PRCC
+sizemod$param<-rownames(sizemod)
+colnames(sizemod)[4:5] <- c("maxCI", "minCI")
+sizemod$maxCI[which(sizemod$maxCI>1)]<-1
+sizemod$maxCI[which(sizemod$maxCI< -1)]<- -1
+sizemod$minCI[which(sizemod$minCI>1)]<-1
+sizemod$minCI[which(sizemod$minCI< -1)]<- -1
+
+E<- ggplot(sizemod, aes(x=param, y = original)) +
+  geom_point(size = 4)+
+  geom_errorbar(aes(ymax = maxCI, ymin = minCI))+
+  ggtitle("Cumulative moderate QALYS 5-17")+
+  xlab("Parameters")+
+  ylab ("Partial Rank Correlation Coefficients")+
+  scale_x_discrete(labels=expression(alpha, beta, delta, nu, "p1", p2[0-4], p2[5-17], p2[18-49], p2[50-64], p2["65+"], "p3", "p4", "p5", p6[0-4], p6[5-17], p6[18-49], p6[50-64], p6["65+"], pi, QoL[mild], QoL[mod], Qol[sev], sigma)) +
+  ylim(-1,1)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+
+#mild QALYS 5-17
+prcc_sizemild <- pcc(scenario2[,1:length(parameternames)], scenario2$CumMildQALY5to17, nboot = 100, rank=TRUE, conf=1-bonferroni.alpha)
+sizemild<-prcc_sizemild$PRCC
+sizemild$param<-rownames(sizemild)
+colnames(sizemild)[4:5] <- c("maxCI", "minCI")
+sizemild$maxCI[which(sizemild$maxCI>1)]<-1
+sizemild$maxCI[which(sizemild$maxCI< -1)]<- -1
+sizemild$minCI[which(sizemild$minCI>1)]<-1
+sizemild$minCI[which(sizemild$minCI< -1)]<- -1
+
+D<- ggplot(sizemild, aes(x=param, y = original)) +
+  geom_point(size = 4)+
+  geom_errorbar(aes(ymax = maxCI, ymin = minCI))+
+  ggtitle("Cumulative mild QALYS 5-17")+
+  xlab("Parameters")+
+  ylab ("Partial Rank Correlation Coefficients")+
+  scale_x_discrete(labels=expression(alpha, beta, delta, nu, "p1", p2[0-4], p2[5-17], p2[18-49], p2[50-64], p2["65+"], "p3", "p4", "p5", p6[0-4], p6[5-17], p6[18-49], p6[50-64], p6["65+"], pi, QoL[mild], QoL[mod], Qol[sev], sigma)) +
+  ylim(-1,1)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+
+#max severe 18-49
+prcc_sizesev <- pcc(scenario2[,1:length(parameternames)], scenario2$CumSevQALY18to49, nboot = 100, rank=TRUE, conf=1-bonferroni.alpha)
+
+sizesev<-prcc_sizesev$PRCC
+sizesev$param<-rownames(sizesev)
+colnames(sizesev)[4:5] <- c("maxCI", "minCI")
+sizesev$maxCI[which(sizesev$maxCI>1)]<-1
+sizesev$maxCI[which(sizesev$maxCI< -1)]<- -1
+sizesev$minCI[which(sizesev$minCI>1)]<-1
+sizesev$minCI[which(sizesev$minCI< -1)]<- -1
+
+I<- ggplot(sizesev, aes(x=param, y = original)) +
+  geom_point(size = 4)+
+  geom_errorbar(aes(ymax = maxCI, ymin = minCI))+
+  ggtitle("Cumulative severe QALYS 18-49")+
+  xlab("Parameters")+
+  ylab ("Partial Rank Correlation Coefficients")+
+  scale_x_discrete(labels=expression(alpha, beta, delta, nu, "p1", p2[0-4], p2[5-17], p2[18-49], p2[50-64], p2["65+"], "p3", "p4", "p5", p6[0-4], p6[5-17], p6[18-49], p6[50-64], p6["65+"], pi, QoL[mild], QoL[mod], Qol[sev], sigma)) +
+  ylim(-1,1)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+
+#moderate QALYS 18-49
+prcc_sizemod <- pcc(scenario2[,1:length(parameternames)], scenario2$CumModQALY18to49, nboot = 100, rank=TRUE, conf=1-bonferroni.alpha)
+
+sizemod<-prcc_sizemod$PRCC
+sizemod$param<-rownames(sizemod)
+colnames(sizemod)[4:5] <- c("maxCI", "minCI")
+sizemod$maxCI[which(sizemod$maxCI>1)]<-1
+sizemod$maxCI[which(sizemod$maxCI< -1)]<- -1
+sizemod$minCI[which(sizemod$minCI>1)]<-1
+sizemod$minCI[which(sizemod$minCI< -1)]<- -1
+
+H<- ggplot(sizemod, aes(x=param, y = original)) +
+  geom_point(size = 4)+
+  geom_errorbar(aes(ymax = maxCI, ymin = minCI))+
+  ggtitle("Cumulative moderate QALYS 18-49")+
+  xlab("Parameters")+
+  ylab ("Partial Rank Correlation Coefficients")+
+  scale_x_discrete(labels=expression(alpha, beta, delta, nu, "p1", p2[0-4], p2[5-17], p2[18-49], p2[50-64], p2["65+"], "p3", "p4", "p5", p6[0-4], p6[5-17], p6[18-49], p6[50-64], p6["65+"], pi, QoL[mild], QoL[mod], Qol[sev], sigma)) +
+  ylim(-1,1)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+
+#mild QALYS 18-49
+prcc_sizemild <- pcc(scenario2[,1:length(parameternames)], scenario2$CumMildQALY18to49, nboot = 100, rank=TRUE, conf=1-bonferroni.alpha)
+
+sizemild<-prcc_sizemild$PRCC
+sizemild$param<-rownames(sizemild)
+colnames(sizemild)[4:5] <- c("maxCI", "minCI")
+sizemild$maxCI[which(sizemild$maxCI>1)]<-1
+sizemild$maxCI[which(sizemild$maxCI< -1)]<- -1
+sizemild$minCI[which(sizemild$minCI>1)]<-1
+sizemild$minCI[which(sizemild$minCI< -1)]<- -1
+
+G<- ggplot(sizemild, aes(x=param, y = original)) +
+  geom_point(size = 4)+
+  geom_errorbar(aes(ymax = maxCI, ymin = minCI))+
+  ggtitle("Cumulative mild QALYS 18-49")+
+  xlab("Parameters")+
+  ylab ("Partial Rank Correlation Coefficients")+
+  scale_x_discrete(labels=expression(alpha, beta, delta, nu, "p1", p2[0-4], p2[5-17], p2[18-49], p2[50-64], p2["65+"], "p3", "p4", "p5", p6[0-4], p6[5-17], p6[18-49], p6[50-64], p6["65+"], pi, QoL[mild], QoL[mod], Qol[sev], sigma)) +
+  ylim(-1,1)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+
+#max severe 50-64
+prcc_sizesev <- pcc(scenario2[,1:length(parameternames)], scenario2$CumSevQALY50to64, nboot = 100, rank=TRUE, conf=1-bonferroni.alpha)
+
+sizesev<-prcc_sizesev$PRCC
+sizesev$param<-rownames(sizesev)
+colnames(sizesev)[4:5] <- c("maxCI", "minCI")
+sizesev$maxCI[which(sizesev$maxCI>1)]<-1
+sizesev$maxCI[which(sizesev$maxCI< -1)]<- -1
+sizesev$minCI[which(sizesev$minCI>1)]<-1
+sizesev$minCI[which(sizesev$minCI< -1)]<- -1
+
+L<- ggplot(sizesev, aes(x=param, y = original)) +
+  geom_point(size = 4)+
+  geom_errorbar(aes(ymax = maxCI, ymin = minCI))+
+  ggtitle("Cumulative severe QALYS 50-64")+
+  xlab("Parameters")+
+  ylab ("Partial Rank Correlation Coefficients")+
+  scale_x_discrete(labels=expression(alpha, beta, delta, nu, "p1", p2[0-4], p2[5-17], p2[18-49], p2[50-64], p2["65+"], "p3", "p4", "p5", p6[0-4], p6[5-17], p6[18-49], p6[50-64], p6["65+"], pi, QoL[mild], QoL[mod], Qol[sev], sigma)) +
+  ylim(-1,1)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+
+#moderate QALYS 50-64
+prcc_sizemod <- pcc(scenario2[,1:length(parameternames)], scenario2$CumModQALY50to64, nboot = 100, rank=TRUE, conf=1-bonferroni.alpha)
+
+sizemod<-prcc_sizemod$PRCC
+sizemod$param<-rownames(sizemod)
+colnames(sizemod)[4:5] <- c("maxCI", "minCI")
+sizemod$maxCI[which(sizemod$maxCI>1)]<-1
+sizemod$maxCI[which(sizemod$maxCI< -1)]<- -1
+sizemod$minCI[which(sizemod$minCI>1)]<-1
+sizemod$minCI[which(sizemod$minCI< -1)]<- -1
+
+K<- ggplot(sizemod, aes(x=param, y = original)) +
+  geom_point(size = 4)+
+  geom_errorbar(aes(ymax = maxCI, ymin = minCI))+
+  ggtitle("Cumulative moderate QALYS 50-64")+
+  xlab("Parameters")+
+  ylab ("Partial Rank Correlation Coefficients")+
+  scale_x_discrete(labels=expression(alpha, beta, delta, nu, "p1", p2[0-4], p2[5-17], p2[18-49], p2[50-64], p2["65+"], "p3", "p4", "p5", p6[0-4], p6[5-17], p6[18-49], p6[50-64], p6["65+"], pi, QoL[mild], QoL[mod], Qol[sev], sigma)) +
+  ylim(-1,1)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+
+#mild QALYS 50-64
+prcc_sizemild <- pcc(scenario2[,1:length(parameternames)], scenario2$CumMildQALY50to64, nboot = 100, rank=TRUE, conf=1-bonferroni.alpha)
+sizemild<-prcc_sizemild$PRCC
+sizemild$param<-rownames(sizemild)
+colnames(sizemild)[4:5] <- c("maxCI", "minCI")
+sizemild$maxCI[which(sizemild$maxCI>1)]<-1
+sizemild$maxCI[which(sizemild$maxCI< -1)]<- -1
+sizemild$minCI[which(sizemild$minCI>1)]<-1
+sizemild$minCI[which(sizemild$minCI< -1)]<- -1
+
+J<- ggplot(sizemild, aes(x=param, y = original)) +
+  geom_point(size = 4)+
+  geom_errorbar(aes(ymax = maxCI, ymin = minCI))+
+  ggtitle("Cumulative mild QALYS 50-64")+
+  xlab("Model Parameters")+
+  ylab ("Partial Rank Correlation Coefficients")+
+  scale_x_discrete(labels=expression(alpha, beta, delta, nu, "p1", p2[0-4], p2[5-17], p2[18-49], p2[50-64], p2["65+"], "p3", "p4", "p5", p6[0-4], p6[5-17], p6[18-49], p6[50-64], p6["65+"], pi, QoL[mild], QoL[mod], Qol[sev], sigma)) +
+  ylim(-1,1)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+
+#max severe 65+
+prcc_sizesev <- pcc(scenario2[,1:length(parameternames)], scenario2$`CumSevQALY65+`, nboot = 100, rank=TRUE, conf=1-bonferroni.alpha)
+
+sizesev<-prcc_sizesev$PRCC
+sizesev$param<-rownames(sizesev)
+colnames(sizesev)[4:5] <- c("maxCI", "minCI")
+sizesev$maxCI[which(sizesev$maxCI>1)]<-1
+sizesev$maxCI[which(sizesev$maxCI< -1)]<- -1
+sizesev$minCI[which(sizesev$minCI>1)]<-1
+sizesev$minCI[which(sizesev$minCI< -1)]<- -1
+
+O<- ggplot(sizesev, aes(x=param, y = original)) +
+  geom_point(size = 4)+
+  geom_errorbar(aes(ymax = maxCI, ymin = minCI))+
+  ggtitle("Cumulative severe QALYS 65+")+
+  xlab("Model Parameters")+
+  ylab ("Partial Rank Correlation Coefficients")+
+  scale_x_discrete(labels=expression(alpha, beta, delta, nu, "p1", p2[0-4], p2[5-17], p2[18-49], p2[50-64], p2["65+"], "p3", "p4", "p5", p6[0-4], p6[5-17], p6[18-49], p6[50-64], p6["65+"], pi, QoL[mild], QoL[mod], Qol[sev], sigma)) +
+  ylim(-1,1)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+
+#moderate QALYS 65+
+prcc_sizemod <- pcc(scenario2[,1:length(parameternames)], scenario2$`CumModQALY65+`, nboot = 100, rank=TRUE, conf=1-bonferroni.alpha)
+
+sizemod<-prcc_sizemod$PRCC
+sizemod$param<-rownames(sizemod)
+colnames(sizemod)[4:5] <- c("maxCI", "minCI")
+sizemod$maxCI[which(sizemod$maxCI>1)]<-1
+sizemod$maxCI[which(sizemod$maxCI< -1)]<- -1
+sizemod$minCI[which(sizemod$minCI>1)]<-1
+sizemod$minCI[which(sizemod$minCI< -1)]<- -1
+
+N<- ggplot(sizemod, aes(x=param, y = original)) +
+  geom_point(size = 4)+
+  geom_errorbar(aes(ymax = maxCI, ymin = minCI))+
+  ggtitle("Cumulative moderate QALYS 65+")+
+  xlab("Parameters")+
+  ylab ("Partial Rank Correlation Coefficients")+
+  scale_x_discrete(labels=expression(alpha, beta, delta, nu, "p1", p2[0-4], p2[5-17], p2[18-49], p2[50-64], p2["65+"], "p3", "p4", "p5", p6[0-4], p6[5-17], p6[18-49], p6[50-64], p6["65+"], pi, QoL[mild], QoL[mod], Qol[sev], sigma)) +
+  ylim(-1,1)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+
+#mild QALYS 65+
+prcc_sizemild <- pcc(scenario2[,1:length(parameternames)], scenario2$`CumMildQALY65+`, nboot = 100, rank=TRUE, conf=1-bonferroni.alpha)
+sizemild<-prcc_sizemild$PRCC
+sizemild$param<-rownames(sizemild)
+colnames(sizemild)[4:5] <- c("maxCI", "minCI")
+sizemild$maxCI[which(sizemild$maxCI>1)]<-1
+sizemild$maxCI[which(sizemild$maxCI< -1)]<- -1
+sizemild$minCI[which(sizemild$minCI>1)]<-1
+sizemild$minCI[which(sizemild$minCI< -1)]<- -1
+
+M<- ggplot(sizemild, aes(x=param, y = original)) +
+  geom_point(size = 4)+
+  geom_errorbar(aes(ymax = maxCI, ymin = minCI))+
+  ggtitle("Cumulative mild QALYS 65+")+
+  xlab("Model Parameters")+
+  ylab ("Partial Rank Correlation Coefficients")+
+  scale_x_discrete(labels=expression(alpha, beta, delta, nu, "p1", p2[0-4], p2[5-17], p2[18-49], p2[50-64], p2["65+"], "p3", "p4", "p5", p6[0-4], p6[5-17], p6[18-49], p6[50-64], p6["65+"], pi, QoL[mild], QoL[mod], Qol[sev], sigma)) +
+  ylim(-1,1)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+
+#Compare PRCC across all severity levels and ages (eFigure 2)
+plot_grid(A04, B04, C04, D, E, F, G, H, I, J, K, L, M, N, O, labels = c('A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O'), ncol=6)
+```
